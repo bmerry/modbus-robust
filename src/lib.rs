@@ -117,15 +117,21 @@ impl<C: Connector> SlaveContext for RobustClient<C> {
 #[async_trait]
 impl<C: Connector> Client for RobustClient<C> {
     async fn call(&mut self, req: Request<'_>) -> Result<Response, Error> {
-        let client = match self.client {
+        let (client, fresh) = match self.client {
             None => {
                 let c = self.connector.connect(self.slave).await?;
-                self.client.insert(c)
+                (self.client.insert(c), true)
             }
-            Some(ref mut c) => c,
+            Some(ref mut c) => (c, false),
         };
-        // TODO: need to put the disconnect/retry logic in here
-        client.call(req).await
+        match client.call(req.clone()).await {
+            result if fresh => result, // Don't retry if this is a brand new connection
+            Ok(response) => Ok(response),
+            Err(_) => {
+                let c = self.connector.connect(self.slave).await?;
+                self.client.insert(c).call(req).await
+            }
+        }
     }
 }
 
@@ -135,53 +141,116 @@ mod test {
     use std::sync::{Arc, Mutex};
     use tokio_modbus::prelude::*;
 
-    #[derive(Debug)]
-    struct DummyConnector<I: Iterator<Item = Result<Response, Error>> + Send + Debug> {
-        data: Arc<Mutex<I>>,
+    trait DummyState: Send + Debug {
+        fn connect(&mut self, slave: Slave) -> Result<(), Error>;
+        fn call(&mut self, req: Request) -> Result<Response, Error>;
     }
 
     #[derive(Debug)]
-    struct DummyClient<I: Iterator<Item = Result<Response, Error>> + Send + Debug> {
-        data: Arc<Mutex<I>>,
+    struct IterDummyState<
+        I: Iterator<Item = Result<Response, Error>> + Send + Debug,
+        J: Iterator<Item = Result<(), Error>> + Send + Debug,
+    > {
+        responses: I,
+        connects: J,
     }
 
-    impl<I: Iterator<Item = Result<Response, Error>> + Send + Debug> DummyConnector<I> {
-        fn new(data: I) -> Self {
+    impl<
+            I: Iterator<Item = Result<Response, Error>> + Send + Debug,
+            J: Iterator<Item = Result<(), Error>> + Send + Debug,
+        > IterDummyState<I, J>
+    {
+        fn new(responses: I, connects: J) -> Self {
             Self {
-                data: Arc::new(Mutex::new(data)),
+                responses,
+                connects,
+            }
+        }
+    }
+
+    impl<
+            I: Iterator<Item = Result<Response, Error>> + Send + Debug,
+            J: Iterator<Item = Result<(), Error>> + Send + Debug,
+        > DummyState for IterDummyState<I, J>
+    {
+        fn connect(&mut self, _slave: Slave) -> Result<(), Error> {
+            self.connects.next().unwrap()
+        }
+
+        fn call(&mut self, _req: Request) -> Result<Response, Error> {
+            self.responses.next().unwrap()
+        }
+    }
+
+    #[derive(Debug)]
+    struct DummyConnector<S: DummyState> {
+        state: Arc<Mutex<S>>,
+    }
+
+    #[derive(Debug)]
+    struct DummyClient<S: DummyState> {
+        state: Arc<Mutex<S>>,
+    }
+
+    impl<S: DummyState> DummyConnector<S> {
+        fn new(state: S) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(state)),
             }
         }
     }
 
     #[async_trait]
-    impl<I: Iterator<Item = Result<Response, Error>> + Send + Debug> Connector for DummyConnector<I> {
-        type Output = DummyClient<I>;
+    impl<S: DummyState> Connector for DummyConnector<S> {
+        type Output = DummyClient<S>;
 
-        async fn connect(&self, _slave: Slave) -> Result<DummyClient<I>, Error> {
-            Ok(DummyClient {
-                data: self.data.clone(),
+        async fn connect(&self, slave: Slave) -> Result<DummyClient<S>, Error> {
+            let mut state = self.state.lock().unwrap();
+            state.connect(slave).map(|_| DummyClient {
+                state: self.state.clone(),
             })
         }
     }
 
-    impl<I: Iterator<Item = Result<Response, Error>> + Send + Debug> SlaveContext for DummyClient<I> {
+    impl<S: DummyState> SlaveContext for DummyClient<S> {
         fn set_slave(&mut self, _slave: Slave) {}
     }
 
     #[async_trait]
-    impl<I: Iterator<Item = Result<Response, Error>> + Send + Debug> Client for DummyClient<I> {
-        async fn call(&mut self, _req: Request<'_>) -> Result<Response, Error> {
-            self.data.lock().unwrap().next().unwrap()
+    impl<S: DummyState> Client for DummyClient<S> {
+        async fn call(&mut self, req: Request<'_>) -> Result<Response, Error> {
+            let mut state = self.state.lock().unwrap();
+            state.call(req)
         }
+    }
+
+    fn make_client(
+        responses: Vec<Result<Response, Error>>,
+        connects: Vec<Result<(), Error>>,
+    ) -> Context {
+        let state = IterDummyState::new(responses.into_iter(), connects.into_iter());
+        let client = RobustClient::new(DummyConnector::new(state), Slave(1));
+        return (Box::new(client) as Box<dyn Client>).into();
     }
 
     #[tokio::test]
     async fn test_success() {
-        let responses = vec![Ok(Response::ReadHoldingRegisters(vec![123]))].into_iter();
-        let client = RobustClient::new(DummyConnector::new(responses), Slave(1));
-        let client = Box::new(client);
-        let client = client as Box<dyn Client>;
-        let mut client: Context = client.into();
+        let responses = vec![Ok(Response::ReadHoldingRegisters(vec![123]))];
+        let connects = vec![Ok(())];
+        let mut client = make_client(responses, connects);
+        let result = client.read_holding_registers(321, 1).await.unwrap();
+        assert_eq!(result, vec![123]);
+    }
+
+    #[tokio::test]
+    async fn test_call_failure() {
+        let responses = vec![
+            Ok(Response::ReadHoldingRegisters(vec![123])),
+            Err(Error::from(std::io::ErrorKind::ConnectionReset)),
+            Ok(Response::ReadHoldingRegisters(vec![123])),
+        ];
+        let connects = vec![Ok(()), Ok(())];
+        let mut client = make_client(responses, connects);
         let result = client.read_holding_registers(321, 1).await.unwrap();
         assert_eq!(result, vec![123]);
     }
