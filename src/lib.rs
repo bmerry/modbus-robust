@@ -224,6 +224,12 @@ mod test {
         }
     }
 
+    fn make_client_always_connect(responses: Vec<Result<Response, Error>>) -> Context {
+        let state = IterDummyState::new(responses.into_iter(), std::iter::repeat_with(|| Ok(())));
+        let client = RobustClient::new(DummyConnector::new(state), Slave(1));
+        return (Box::new(client) as Box<dyn Client>).into();
+    }
+
     fn make_client(
         responses: Vec<Result<Response, Error>>,
         connects: Vec<Result<(), Error>>,
@@ -236,8 +242,7 @@ mod test {
     #[tokio::test]
     async fn test_success() {
         let responses = vec![Ok(Response::ReadHoldingRegisters(vec![123]))];
-        let connects = vec![Ok(())];
-        let mut client = make_client(responses, connects);
+        let mut client = make_client_always_connect(responses);
         let result = client.read_holding_registers(321, 1).await.unwrap();
         assert_eq!(result, vec![123]);
     }
@@ -249,9 +254,47 @@ mod test {
             Err(Error::from(std::io::ErrorKind::ConnectionReset)),
             Ok(Response::ReadHoldingRegisters(vec![123])),
         ];
-        let connects = vec![Ok(()), Ok(())];
-        let mut client = make_client(responses, connects);
+        let mut client = make_client_always_connect(responses);
+        let _ = client.read_holding_registers(321, 1).await; // Establish connection
         let result = client.read_holding_registers(321, 1).await.unwrap();
         assert_eq!(result, vec![123]);
+    }
+
+    #[tokio::test]
+    async fn test_call_double_failure() {
+        let responses = vec![
+            Ok(Response::ReadHoldingRegisters(vec![123])),
+            Err(Error::from(std::io::ErrorKind::ConnectionReset)),
+            Err(Error::from(std::io::ErrorKind::PermissionDenied)),
+        ];
+        let mut client = make_client_always_connect(responses);
+        let _ = client.read_holding_registers(321, 1).await; // Establish connection
+        let result = client.read_holding_registers(321, 1).await.unwrap_err();
+        assert_eq!(result.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn test_connect_failure() {
+        let responses = vec![];
+        let connects = vec![Err(Error::from(std::io::ErrorKind::ConnectionRefused))];
+        let mut client = make_client(responses, connects);
+        let result = client.read_holding_registers(321, 1).await.unwrap_err();
+        assert_eq!(result.kind(), std::io::ErrorKind::ConnectionRefused);
+    }
+
+    #[tokio::test]
+    async fn test_connect_failure2() {
+        let responses = vec![
+            Ok(Response::ReadHoldingRegisters(vec![123])),
+            Err(Error::from(std::io::ErrorKind::ConnectionReset)),
+        ];
+        let connects = vec![
+            Ok(()),
+            Err(Error::from(std::io::ErrorKind::ConnectionRefused)),
+        ];
+        let mut client = make_client(responses, connects);
+        let _ = client.read_holding_registers(321, 1).await; // Establish connection
+        let result = client.read_holding_registers(321, 1).await.unwrap_err();
+        assert_eq!(result.kind(), std::io::ErrorKind::ConnectionRefused);
     }
 }
