@@ -1,3 +1,21 @@
+/* Copyright 2022-2023 Bruce Merry
+ *
+ * This program is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the Free
+ * Software Foundation, either version 3 of the License, or (at your option)
+ * any later version.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#![doc = include_str!("../README.md")]
+
 use async_trait::async_trait;
 use std::fmt::Debug;
 use std::io::Error;
@@ -6,44 +24,56 @@ use tokio_modbus::client::{Client, Context};
 use tokio_modbus::slave::{Slave, SlaveContext};
 use tokio_modbus::{Request, Response};
 
+/// Establish a connection. The implementation must support calling
+/// [`Connector::connect`] multiple times.
 #[async_trait]
 pub trait Connector: Send + Debug {
     type Output: Client;
 
-    async fn connect(&self, slave: Slave) -> Result<Self::Output, Error>;
+    /// Establish a connection.
+    async fn connect(&mut self, slave: Slave) -> Result<Self::Output, Error>;
 }
 
-pub struct SyncConnector<T: Client, F: Fn(Slave) -> Result<T, Error> + Send + Sync> {
+/// Establish a connection using a factory function.
+///
+/// In practice, the function needs to be `'static` to be able to use this to
+/// obtain a [`tokio_modbus::client::Context`].
+pub struct SyncConnector<T: Client, F: FnMut(Slave) -> Result<T, Error> + Send + Sync> {
     factory: F,
 }
 
-impl<T: Client, F: Fn(Slave) -> Result<T, Error> + Send + Sync> SyncConnector<T, F> {
+impl<T: Client, F: FnMut(Slave) -> Result<T, Error> + Send + Sync> SyncConnector<T, F> {
+    /// Create from a factory function.
     pub fn new(factory: F) -> Self {
         Self { factory }
     }
 }
 
-impl<T: Client, F: Fn(Slave) -> Result<T, Error> + Send + Sync> Debug for SyncConnector<T, F> {
+impl<T: Client, F: FnMut(Slave) -> Result<T, Error> + Send + Sync> Debug for SyncConnector<T, F> {
     fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(fmt, "SyncConnector()")
     }
 }
 
 #[async_trait]
-impl<T: Client, F: Fn(Slave) -> Result<T, Error> + Send + Sync> Connector for SyncConnector<T, F> {
+impl<T: Client, F: FnMut(Slave) -> Result<T, Error> + Send + Sync> Connector
+    for SyncConnector<T, F>
+{
     type Output = T;
 
-    async fn connect(&self, slave: Slave) -> Result<T, Error> {
+    async fn connect(&mut self, slave: Slave) -> Result<T, Error> {
         (self.factory)(slave)
     }
 }
 
+/// Implementation of [`Connector`] for TCP connections.
 #[derive(Debug)]
 pub struct TcpSlaveConnector {
     socket_addr: SocketAddr,
 }
 
 impl TcpSlaveConnector {
+    /// Construct.
     pub fn new(socket_addr: SocketAddr) -> Self {
         Self { socket_addr }
     }
@@ -53,11 +83,12 @@ impl TcpSlaveConnector {
 impl Connector for TcpSlaveConnector {
     type Output = Context;
 
-    async fn connect(&self, slave: Slave) -> Result<Context, Error> {
+    async fn connect(&mut self, slave: Slave) -> Result<Context, Error> {
         tokio_modbus::client::tcp::connect_slave(self.socket_addr, slave).await
     }
 }
 
+/// Client that automatically reconnects and retries on failure.
 #[derive(Debug)]
 pub struct RobustClient<C: Connector> {
     connector: C,
@@ -66,6 +97,10 @@ pub struct RobustClient<C: Connector> {
 }
 
 impl<C: Connector> RobustClient<C> {
+    /// Construct a robust client.
+    ///
+    /// When constructed, there is no established connection. An attempt will
+    /// be made to establish one on the first call.
     pub fn new(connector: C, slave: Slave) -> Self {
         Self {
             connector,
@@ -75,22 +110,50 @@ impl<C: Connector> RobustClient<C> {
     }
 }
 
-pub fn new_sync<T: Client, F: Fn(Slave) -> Result<T, Error> + Send + Sync>(
+impl<C: Connector + 'static> RobustClient<C> {
+    /// Construct a robust client wrapped in a
+    /// [`tokio_modbus::client::Context`].
+    ///
+    /// This is the constructor you will most likely want to use, because
+    /// [Context][`tokio_modbus::client::Context`] provides all the
+    /// convenience functions.
+    pub fn new_context(connector: C, slave: Slave) -> Context {
+        (Box::new(Self::new(connector, slave)) as Box<dyn Client>).into()
+    }
+}
+
+/// Construct a [`tokio_modbus::client::Context`] from a connection factory
+/// function.
+///
+/// The connection is not immediately established. It will be attempted on
+/// the first call.
+pub fn new_sync<
+    T: Client + 'static,
+    F: FnMut(Slave) -> Result<T, Error> + Send + Sync + 'static,
+>(
     factory: F,
     slave: Slave,
-) -> RobustClient<SyncConnector<T, F>> {
-    RobustClient::new(SyncConnector::new(factory), slave)
+) -> Context {
+    RobustClient::new_context(SyncConnector::new(factory), slave)
 }
 
-pub fn new_tcp_slave(socket_addr: SocketAddr, slave: Slave) -> RobustClient<TcpSlaveConnector> {
-    RobustClient::new(TcpSlaveConnector::new(socket_addr), slave)
+/// Construct a [`tokio_modbus::client::Context`] for a TCP connection.
+///
+/// The connection is not immediately established. It will be attempted on
+/// the first call.
+pub fn new_tcp_slave(socket_addr: SocketAddr, slave: Slave) -> Context {
+    RobustClient::new_context(TcpSlaveConnector::new(socket_addr), slave)
 }
 
-pub fn new_rtu_slave(
-    device: impl Into<String>,
-    baud_rate: u32,
-    slave: Slave,
-) -> RobustClient<SyncConnector<Context, impl Fn(Slave) -> Result<Context, Error> + Send + Sync>> {
+/// Construct a [`tokio_modbus::client::Context`] for an RTU connection.
+///
+/// The connection is not immediately established. It will be attempted on
+/// the first call.
+///
+/// This implementation only allows the baud rate to be set, and not other
+/// options such as the parity bits. If more control is needed, use
+/// [`new_sync`].
+pub fn new_rtu_slave(device: impl Into<String>, baud_rate: u32, slave: Slave) -> Context {
     let device = device.into();
     new_sync(
         move |slave| -> Result<Context, Error> {
@@ -204,7 +267,7 @@ mod test {
     impl<S: DummyState> Connector for DummyConnector<S> {
         type Output = DummyClient<S>;
 
-        async fn connect(&self, slave: Slave) -> Result<DummyClient<S>, Error> {
+        async fn connect(&mut self, slave: Slave) -> Result<DummyClient<S>, Error> {
             let mut state = self.state.lock().unwrap();
             state.connect(slave).map(|_| DummyClient {
                 state: self.state.clone(),
@@ -226,8 +289,7 @@ mod test {
 
     fn make_client_always_connect(responses: Vec<Result<Response, Error>>) -> Context {
         let state = IterDummyState::new(responses.into_iter(), std::iter::repeat_with(|| Ok(())));
-        let client = RobustClient::new(DummyConnector::new(state), Slave(1));
-        return (Box::new(client) as Box<dyn Client>).into();
+        RobustClient::new_context(DummyConnector::new(state), Slave(1))
     }
 
     fn make_client(
@@ -235,8 +297,7 @@ mod test {
         connects: Vec<Result<(), Error>>,
     ) -> Context {
         let state = IterDummyState::new(responses.into_iter(), connects.into_iter());
-        let client = RobustClient::new(DummyConnector::new(state), Slave(1));
-        return (Box::new(client) as Box<dyn Client>).into();
+        RobustClient::new_context(DummyConnector::new(state), Slave(1))
     }
 
     #[tokio::test]
