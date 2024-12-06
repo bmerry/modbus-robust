@@ -1,4 +1,4 @@
-# Copyright 2023 Bruce Merry
+# Copyright 2024 Bruce Merry
 #
 # This program is free software: you can redistribute it and/or modify it
 # under the terms of the GNU General Public License as published by the Free
@@ -15,7 +15,7 @@
 
 [package]
 name = "modbus-robust"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Bruce Merry"]
 license = "GPL-3.0-or-later"
