@@ -179,10 +179,14 @@ impl<C: Connector> SlaveContext for RobustClient<C> {
 
 #[async_trait]
 impl<C: Connector> Client for RobustClient<C> {
-    async fn call(&mut self, req: Request<'_>) -> Result<Response, Error> {
+    async fn call(&mut self, req: Request<'_>) -> tokio_modbus::Result<Response> {
         let (client, fresh) = match self.client {
             None => {
-                let c = self.connector.connect(self.slave).await?;
+                let c = self
+                    .connector
+                    .connect(self.slave)
+                    .await
+                    .map_err(tokio_modbus::Error::Transport)?;
                 (self.client.insert(c), true)
             }
             Some(ref mut c) => (c, false),
@@ -191,10 +195,22 @@ impl<C: Connector> Client for RobustClient<C> {
             result if fresh => result, // Don't retry if this is a brand new connection
             Ok(response) => Ok(response),
             Err(_) => {
+                /* Note: an inner ExceptionCode takes the Ok path above. It
+                 * indicates that the server rejected the request, so retrying
+                 * is unlikely to help.
+                 */
                 let c = self.connector.connect(self.slave).await?;
                 self.client.insert(c).call(req).await
             }
         }
+    }
+
+    async fn disconnect(&mut self) -> Result<(), Error> {
+        if let Some(c) = &mut self.client {
+            c.disconnect().await?;
+        }
+        self.client.take(); // Clears out the client
+        Ok(())
     }
 }
 
@@ -206,12 +222,12 @@ mod test {
 
     trait DummyState: Send + Debug {
         fn connect(&mut self, slave: Slave) -> Result<(), Error>;
-        fn call(&mut self, req: Request) -> Result<Response, Error>;
+        fn call(&mut self, req: Request) -> tokio_modbus::Result<Response>;
     }
 
     #[derive(Debug)]
     struct IterDummyState<
-        I: Iterator<Item = Result<Response, Error>> + Send + Debug,
+        I: Iterator<Item = tokio_modbus::Result<Response>> + Send + Debug,
         J: Iterator<Item = Result<(), Error>> + Send + Debug,
     > {
         responses: I,
@@ -219,7 +235,7 @@ mod test {
     }
 
     impl<
-            I: Iterator<Item = Result<Response, Error>> + Send + Debug,
+            I: Iterator<Item = tokio_modbus::Result<Response>> + Send + Debug,
             J: Iterator<Item = Result<(), Error>> + Send + Debug,
         > IterDummyState<I, J>
     {
@@ -232,7 +248,7 @@ mod test {
     }
 
     impl<
-            I: Iterator<Item = Result<Response, Error>> + Send + Debug,
+            I: Iterator<Item = tokio_modbus::Result<Response>> + Send + Debug,
             J: Iterator<Item = Result<(), Error>> + Send + Debug,
         > DummyState for IterDummyState<I, J>
     {
@@ -240,7 +256,7 @@ mod test {
             self.connects.next().unwrap()
         }
 
-        fn call(&mut self, _req: Request) -> Result<Response, Error> {
+        fn call(&mut self, _req: Request) -> tokio_modbus::Result<Response> {
             self.responses.next().unwrap()
         }
     }
@@ -281,19 +297,22 @@ mod test {
 
     #[async_trait]
     impl<S: DummyState> Client for DummyClient<S> {
-        async fn call(&mut self, req: Request<'_>) -> Result<Response, Error> {
+        async fn call(&mut self, req: Request<'_>) -> tokio_modbus::Result<Response> {
             let mut state = self.state.lock().unwrap();
             state.call(req)
         }
+        async fn disconnect(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
     }
 
-    fn make_client_always_connect(responses: Vec<Result<Response, Error>>) -> Context {
+    fn make_client_always_connect(responses: Vec<tokio_modbus::Result<Response>>) -> Context {
         let state = IterDummyState::new(responses.into_iter(), std::iter::repeat_with(|| Ok(())));
         RobustClient::new_context(DummyConnector::new(state), Slave(1))
     }
 
     fn make_client(
-        responses: Vec<Result<Response, Error>>,
+        responses: Vec<tokio_modbus::Result<Response>>,
         connects: Vec<Result<(), Error>>,
     ) -> Context {
         let state = IterDummyState::new(responses.into_iter(), connects.into_iter());
@@ -302,36 +321,56 @@ mod test {
 
     #[tokio::test]
     async fn test_success() {
-        let responses = vec![Ok(Response::ReadHoldingRegisters(vec![123]))];
+        let responses = vec![Ok(Ok(Response::ReadHoldingRegisters(vec![123])))];
         let mut client = make_client_always_connect(responses);
-        let result = client.read_holding_registers(321, 1).await.unwrap();
+        let result = client
+            .read_holding_registers(321, 1)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(result, vec![123]);
     }
 
     #[tokio::test]
     async fn test_call_failure() {
         let responses = vec![
-            Ok(Response::ReadHoldingRegisters(vec![123])),
-            Err(Error::from(std::io::ErrorKind::ConnectionReset)),
-            Ok(Response::ReadHoldingRegisters(vec![123])),
+            Ok(Ok(Response::ReadHoldingRegisters(vec![123]))),
+            Err(tokio_modbus::Error::Transport(Error::from(
+                std::io::ErrorKind::ConnectionReset,
+            ))),
+            Ok(Ok(Response::ReadHoldingRegisters(vec![123]))),
         ];
         let mut client = make_client_always_connect(responses);
         let _ = client.read_holding_registers(321, 1).await; // Establish connection
-        let result = client.read_holding_registers(321, 1).await.unwrap();
+        let result = client
+            .read_holding_registers(321, 1)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(result, vec![123]);
     }
 
     #[tokio::test]
     async fn test_call_double_failure() {
         let responses = vec![
-            Ok(Response::ReadHoldingRegisters(vec![123])),
-            Err(Error::from(std::io::ErrorKind::ConnectionReset)),
-            Err(Error::from(std::io::ErrorKind::PermissionDenied)),
+            Ok(Ok(Response::ReadHoldingRegisters(vec![123]))),
+            Err(tokio_modbus::Error::Transport(Error::from(
+                std::io::ErrorKind::ConnectionReset,
+            ))),
+            Err(tokio_modbus::Error::Transport(Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            ))),
         ];
         let mut client = make_client_always_connect(responses);
         let _ = client.read_holding_registers(321, 1).await; // Establish connection
-        let result = client.read_holding_registers(321, 1).await.unwrap_err();
-        assert_eq!(result.kind(), std::io::ErrorKind::PermissionDenied);
+        match client.read_holding_registers(321, 1).await.unwrap_err() {
+            tokio_modbus::Error::Transport(err) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+            }
+            _ => {
+                panic!("Wrong error type");
+            }
+        }
     }
 
     #[tokio::test]
@@ -339,15 +378,23 @@ mod test {
         let responses = vec![];
         let connects = vec![Err(Error::from(std::io::ErrorKind::ConnectionRefused))];
         let mut client = make_client(responses, connects);
-        let result = client.read_holding_registers(321, 1).await.unwrap_err();
-        assert_eq!(result.kind(), std::io::ErrorKind::ConnectionRefused);
+        match client.read_holding_registers(321, 1).await.unwrap_err() {
+            tokio_modbus::Error::Transport(err) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+            }
+            _ => {
+                panic!("Wrong error type");
+            }
+        }
     }
 
     #[tokio::test]
     async fn test_connect_failure2() {
         let responses = vec![
-            Ok(Response::ReadHoldingRegisters(vec![123])),
-            Err(Error::from(std::io::ErrorKind::ConnectionReset)),
+            Ok(Ok(Response::ReadHoldingRegisters(vec![123]))),
+            Err(tokio_modbus::Error::Transport(Error::from(
+                std::io::ErrorKind::ConnectionReset,
+            ))),
         ];
         let connects = vec![
             Ok(()),
@@ -355,7 +402,13 @@ mod test {
         ];
         let mut client = make_client(responses, connects);
         let _ = client.read_holding_registers(321, 1).await; // Establish connection
-        let result = client.read_holding_registers(321, 1).await.unwrap_err();
-        assert_eq!(result.kind(), std::io::ErrorKind::ConnectionRefused);
+        match client.read_holding_registers(321, 1).await.unwrap_err() {
+            tokio_modbus::Error::Transport(err) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+            }
+            _ => {
+                panic!("Wrong error type");
+            }
+        }
     }
 }
