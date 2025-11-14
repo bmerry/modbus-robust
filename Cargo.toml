@@ -25,7 +25,7 @@ repository = "https://github.com/bmerry/modbus-robust"
 [dependencies]
 async-trait = "0.1.75"
 tokio = "1.35.1"
-tokio-modbus = "0.16.0"
+tokio-modbus = "0.17.0"
 tokio-serial = "5.4.4"
 
 [dev-dependencies]
